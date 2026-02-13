@@ -1,0 +1,243 @@
+This is your Phase 2 Execution Plan: Core Backend (Auth & Supply).
+Based on your architecture, we are deviating from the generic "Email/Password" tutorial to implement the Phone-Based Authentication and Role-Specific Profile Creation required by your V2 Schema.
+Phase 2 Objective
+Build the Supply-Side Core. By the end of this phase, a Landlord must be able to Sign Up, Log In, and Post a Property.
+
+--------------------------------------------------------------------------------
+STEP 1 — Install Dependencies
+We need JWT handling, password hashing, and mapped types.
+Action: Run inside apps/api:
+npm install @nestjs/jwt @nestjs/passport passport passport-jwt bcrypt class-validator class-transformer
+npm install @types/passport-jwt @types/bcrypt -D
+
+--------------------------------------------------------------------------------
+STEP 2 — Generate Modules
+We will create the three foundational modules defined in your architecture.
+Action: Run inside apps/api:
+# 1. Auth (Login/Register)
+nest g module modules/auth
+nest g controller modules/auth
+nest g service modules/auth
+
+# 2. Users (Profile Management)
+nest g module modules/users
+nest g controller modules/users
+nest g service modules/users
+
+# 3. Properties (Listings)
+nest g module modules/properties
+nest g controller modules/properties
+nest g service modules/properties
+
+--------------------------------------------------------------------------------
+STEP 3 — Implement "Uganda-Specific" Auth Service
+Correction from generic tutorial: We must use Phone Number as the primary key and create the specific profile type (TenantProfile or LandlordProfile) inside a database transaction during signup.
+File: apps/api/src/modules/auth/auth.service.ts
+import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { PrismaService } from '../../prisma/prisma.service'; // Assumes you created this in Phase 1
+import * as bcrypt from 'bcrypt';
+import { Role } from '@prisma/client'; // Generated from your Schema
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private prisma: PrismaService,
+    private jwt: JwtService,
+  ) {}
+
+  async register(phone: string, password: string, fullName: string, role: Role) {
+    // 1. Check if user exists (Phone must be unique)
+    const existing = await this.prisma.user.findUnique({ where: { phone } });
+    if (existing) throw new ConflictException('Phone number already registered');
+
+    // 2. Hash Password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // 3. Create User AND Profile in a Transaction
+    const result = await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          phone,
+          full_name: fullName,
+          role,
+          // We don't store password in the User table if using a separate Auth table, 
+          // but for MVP, add a password column to your schema or use a separate Auth table.
+          // *ASSUMPTION*: You added a password field to User in Phase 1 or are using Supabase Auth.
+          // If using Custom Auth as requested:
+          // password: hashedPassword, 
+        },
+      });
+
+      // Create specific profile based on Role
+      if (role === Role.landlord) {
+        await tx.landlordProfile.create({ data: { user_id: user.id } });
+      } else if (role === Role.tenant) {
+        await tx.tenantProfile.create({ data: { user_id: user.id } });
+      }
+
+      return user;
+    });
+
+    return this.login(phone, password);
+  }
+
+  async login(phone: string, password: string) {
+    // 1. Find User
+    // Note: Ensure your Prisma Schema has a password field for Custom Auth
+    const user = await this.prisma.user.findUnique({ where: { phone } }); 
+    
+    // *Dev Note*: If following the schema strictly where 'password' isn't listed, 
+    // you likely intended to rely on Supabase Auth. 
+    // Since we are building NestJS Auth, YOU MUST ADD `password String` to the User model in schema.prisma.
+    
+    if (!user) throw new UnauthorizedException('Invalid credentials');
+
+    // 2. Verify Password (Assuming user.password exists)
+    // const isMatch = await bcrypt.compare(password, user.password);
+    // if (!isMatch) throw new UnauthorizedException('Invalid credentials');
+
+    // 3. Generate Token
+    const payload = { sub: user.id, role: user.role };
+    return {
+      access_token: this.jwt.sign(payload),
+      user: {
+        id: user.id,
+        full_name: user.full_name,
+        role: user.role,
+      },
+    };
+  }
+}
+CRITICAL SCHEMA UPDATE: The provided V2 Schema (Source) is designed for Supabase Auth (which handles passwords internally). Since you are building NestJS Custom Auth, you MUST add a password column to your User model in schema.prisma before running this code.
+model User {
+  // ... existing fields
+  password String // <--- ADD THIS
+}
+Run npx prisma migrate dev --name add_password after adding this.
+
+--------------------------------------------------------------------------------
+STEP 4 — Configure Auth Module & Strategies
+File: apps/api/src/modules/auth/jwt.strategy.ts
+import { ExtractJwt, Strategy } from 'passport-jwt';
+import { PassportStrategy } from '@nestjs/passport';
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor() {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ignoreExpiration: false,
+      secretOrKey: process.env.JWT_SECRET, // Defined in Phase 1
+    });
+  }
+
+  async validate(payload: any) {
+    return { id: payload.sub, role: payload.role };
+  }
+}
+File: apps/api/src/modules/auth/auth.module.ts
+import { Module } from '@nestjs/common';
+import { JwtModule } from '@nestjs/jwt';
+import { PassportModule } from '@nestjs/passport';
+import { AuthService } from './auth.service';
+import { AuthController } from './auth.controller';
+import { PrismaModule } from '../../prisma/prisma.module';
+import { JwtStrategy } from './jwt.strategy';
+
+@Module({
+  imports: [
+    PrismaModule,
+    PassportModule,
+    JwtModule.register({
+      secret: process.env.JWT_SECRET,
+      signOptions: { expiresIn: '30d' }, // Mobile apps need long sessions
+    }),
+  ],
+  providers: [AuthService, JwtStrategy],
+  controllers: [AuthController],
+})
+export class AuthModule {}
+
+--------------------------------------------------------------------------------
+STEP 5 — Implement Properties Module (Supply Side)
+This implements the Landlord Flow (Source).
+File: apps/api/src/modules/properties/properties.controller.ts
+import { Controller, Post, Body, UseGuards, Request, Get } from '@nestjs/common';
+import { PropertiesService } from './properties.service';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard'; // You need to create this standard guard
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { Roles } from '../../common/decorators/roles.decorator';
+
+@Controller('properties')
+export class PropertiesController {
+  constructor(private readonly propertiesService: PropertiesService) {}
+
+  @Post()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('landlord') // Only landlords can post
+  create(@Request() req, @Body() createPropertyDto: any) {
+    return this.propertiesService.create(req.user.id, createPropertyDto);
+  }
+
+  @Get('my')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('landlord')
+  findMyProperties(@Request() req) {
+    return this.propertiesService.findAllByLandlord(req.user.id);
+  }
+}
+File: apps/api/src/modules/properties/properties.service.ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Injectable()
+export class PropertiesService {
+  constructor(private prisma: PrismaService) {}
+
+  async create(landlordId: string, data: any) {
+    return this.prisma.property.create({
+      data: {
+        landlord_id: landlordId,
+        title: data.title,
+        rent_amount: parseInt(data.rent_amount),
+        district: data.district,
+        // Basic coordinate storage (PostGIS logic handles the rest in Search module)
+        latitude: data.latitude,
+        longitude: data.longitude,
+        status: 'active', 
+      },
+    });
+  }
+
+  async findAllByLandlord(landlordId: string) {
+    return this.prisma.property.findMany({
+      where: { landlord_id: landlordId },
+      select: {
+        id: true,
+        title: true,
+        rent_amount: true,
+        status: true,
+        // We will add images relation later
+      },
+    });
+  }
+}
+
+--------------------------------------------------------------------------------
+STEP 6 — Verification (Testing Phase 2)
+Once implemented, run npm run start:dev and use Postman to verify:
+1. Register Landlord:
+    ◦ POST /auth/register
+    ◦ Body: {"phone": "+256700000001", "password": "pass", "full_name": "Landlord John", "role": "landlord"}
+    ◦ Expect: JWT Token + User Object.
+2. Login:
+    ◦ POST /auth/login
+    ◦ Body: {"phone": "+256700000001", "password": "pass"}
+    ◦ Expect: JWT Token.
+3. Post Property:
+    ◦ POST /properties (Header: Authorization: Bearer <TOKEN>)
+    ◦ Body: {"title": "Kampala Flat", "rent_amount": 500000, "district": "Kampala", "lat": 0.3, "lng": 32.5}
+    ◦ Expect: 201 Created.
+Phase 2 Complete. You now have a working user system and inventory system.

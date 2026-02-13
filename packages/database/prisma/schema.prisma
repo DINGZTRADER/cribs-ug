@@ -1,0 +1,130 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  tenant
+  landlord
+  admin
+}
+
+enum Status {
+  active
+  paused
+  deleted
+}
+
+model User {
+  id                   String            @id @default(uuid())
+  role                 Role
+  full_name            String
+  phone                String            @unique
+  email                String?
+  password_hash        String?
+  national_id          String?
+  selfie_url           String?
+  is_identity_verified Boolean           @default(false)
+  badge_score          Int               @default(0)
+  created_at           DateTime          @default(now())
+
+  tenant_profile       TenantProfile?
+  landlord_profile     LandlordProfile?
+  properties           Property[]
+  subscriptions        Subscription[]
+  visits_as_tenant     Visit[]           @relation("TenantVisits")
+  visits_as_landlord   Visit[]           @relation("LandlordVisits")
+
+  @@map("users")
+}
+
+model TenantProfile {
+  user_id           String @id
+  employment_status String?
+  user              User   @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("tenant_profiles")
+}
+
+model LandlordProfile {
+  user_id        String  @id
+  verified_owner Boolean @default(false)
+  user           User    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("landlord_profiles")
+}
+
+model Property {
+  id          String          @id @default(uuid())
+  landlord_id String
+  landlord    User            @relation(fields: [landlord_id], references: [id], onDelete: Cascade)
+  title       String
+  rent_amount Int
+  district    String
+  latitude    Decimal
+  longitude   Decimal
+  status      Status          @default(active)
+
+  images      PropertyImage[]
+  visits      Visit[]
+
+  @@index([status, district, rent_amount])
+  @@map("properties")
+}
+
+model PropertyImage {
+  id            String   @id @default(uuid())
+  property_id   String
+  property      Property @relation(fields: [property_id], references: [id], onDelete: Cascade)
+  thumbnail_url String
+  highres_url   String
+
+  @@map("property_images")
+}
+
+model Subscription {
+  id        String   @id @default(uuid())
+  user_id   String
+  tier      String
+  status    String   @default("active")
+  end_date  DateTime
+  user      User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
+
+model PaymentWebhookEvent {
+  transaction_id         String    @id
+  event                  String
+  user_id                String
+  tier                   String
+  amount                 Int
+  currency               String
+  payload                Json
+  status                 String
+  subscription_end_date  DateTime?
+  processed_at           DateTime  @default(now())
+
+  @@index([processed_at])
+  @@map("payment_webhook_events")
+}
+
+model Visit {
+  id                      String   @id @default(uuid())
+  property_id             String
+  tenant_id               String
+  landlord_id             String
+  property                Property @relation(fields: [property_id], references: [id])
+  tenant                  User     @relation("TenantVisits", fields: [tenant_id], references: [id])
+  landlord                User     @relation("LandlordVisits", fields: [landlord_id], references: [id])
+  scheduled_time          DateTime
+  arrival_confirmed       Boolean  @default(false)
+  completion_confirmed    Boolean  @default(false)
+  safety_alert_triggered  Boolean  @default(false)
+
+  @@map("visits")
+}

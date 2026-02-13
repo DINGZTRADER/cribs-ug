@@ -1,0 +1,239 @@
+This is **Phase 3: Search & Discovery**.
+
+This is the most technically complex phase because we must bridge **standard API logic** with **Geospatial SQL**. We will implement the "Freemium Hook" that allows users to find apartments by location (Radius Search) without logging in.
+
+### **Phase 3 Objective**
+1.  Enable **Radius Search** (e.g., "Find apartments within 3km of this GPS point") using PostGIS.
+2.  Implement **Public Listing Details** (Visible photos/rent, but **HIDDEN** contact info).
+3.  Strictly enforce the **Freemium Data Contract** (never send landlord phone numbers in the search results).
+
+---
+
+### **STEP 1 — Update Property Creation (Critical Fix)**
+In Phase 2, we saved `latitude` and `longitude` as simple numbers. For PostGIS to work, we must also populate the `location` (Geography) column. Since Prisma doesn't natively support PostGIS types perfectly, we must use a **Raw SQL Transaction** to save the data.
+
+**Action:** Update `apps/api/src/modules/properties/properties.service.ts`.
+*Replace the `create` method with this logic:*
+
+```typescript
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+
+@Injectable()
+export class PropertiesService {
+  constructor(private prisma: PrismaService) {}
+
+  async create(landlordId: string, data: any) {
+    // 1. Create the property record using standard Prisma
+    // We store lat/lng as decimals for UI, but 'location' will be null initially
+    const property = await this.prisma.property.create({
+      data: {
+        landlord_id: landlordId,
+        title: data.title,
+        rent_amount: parseInt(data.rent_amount),
+        district: data.district,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        status: 'active',
+        // Add other fields from DTO...
+      },
+    });
+
+    // 2. Update the 'location' column using Raw SQL for PostGIS
+    // ST_SetSRID(ST_MakePoint(lng, lat), 4326) creates the geospatial point
+    await this.prisma.$executeRaw`
+      UPDATE properties
+      SET location = ST_SetSRID(ST_MakePoint(${data.longitude}, ${data.latitude}), 4326)
+      WHERE id = ${property.id}::uuid
+    `;
+
+    return property;
+  }
+  
+  // ... rest of the service
+}
+```
+
+---
+
+### **STEP 2 — Create Search Module**
+
+**Action:** Run inside `apps/api`:
+```bash
+nest g module modules/search
+nest g controller modules/search
+nest g service modules/search
+```
+
+---
+
+### **STEP 3 — Define Search DTO**
+We need strict validation for the query parameters to prevent SQL injection or crashes.
+
+**Action:** Create `apps/api/src/modules/search/dto/search-property.dto.ts`
+
+```typescript
+import { IsOptional, IsNumber, IsString, Min } from 'class-validator';
+import { Type } from 'class-transformer';
+
+export class SearchPropertyDto {
+  @IsOptional()
+  @IsString()
+  district?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  maxRent?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  lat?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  lng?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  radius?: number = 5000; // Default 5km
+}
+```
+
+---
+
+### **STEP 4 — Implement PostGIS Search Logic**
+We will implement the ranking logic and radius search using `prisma.$queryRaw`.
+
+**Action:** Edit `apps/api/src/modules/search/search.service.ts`
+
+```typescript
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { SearchPropertyDto } from './dto/search-property.dto';
+
+@Injectable()
+export class SearchService {
+  constructor(private prisma: PrismaService) {}
+
+  async search(query: SearchPropertyDto) {
+    const { lat, lng, radius, maxRent, district } = query;
+
+    // Base filters
+    // Note: We use Prisma.sql helper if we need dynamic composition, 
+    // but for MVP we can use standard logical checks in the raw query.
+    
+    // We select specific fields to REDUCE DATA PAYLOAD (Source: Low-end Optimization)
+    // We DO NOT select 'phone' or 'highres_url'
+    
+    return this.prisma.$queryRaw`
+      SELECT 
+        p.id,
+        p.title,
+        p.rent_amount,
+        p.district,
+        p.latitude,
+        p.longitude,
+        -- Fetch just the thumbnail
+        (SELECT thumbnail_url FROM property_images WHERE property_id = p.id LIMIT 1) as thumbnail_url,
+        -- Landlord Info (Public Profile)
+        u.full_name as landlord_name,
+        u.badge_score,
+        lp.verified_owner
+      FROM properties p
+      JOIN users u ON p.landlord_id = u.id
+      LEFT JOIN landlord_profiles lp ON u.id = lp.user_id
+      WHERE p.status = 'active'
+      -- Dynamic Filters
+      AND (${maxRent}::int IS NULL OR p.rent_amount <= ${maxRent}::int)
+      AND (${district}::text IS NULL OR p.district ILIKE '%' || ${district}::text || '%')
+      -- Geospatial Filter (Only if lat/lng provided)
+      AND (
+        (${lat}::float IS NULL OR ${lng}::float IS NULL)
+        OR ST_DWithin(
+             p.location, 
+             ST_SetSRID(ST_MakePoint(${lng}::float, ${lat}::float), 4326)::geography, 
+             ${radius}::float
+           )
+      )
+      -- Ranking Algorithm (Source: Architecture)
+      ORDER BY 
+        (CASE WHEN lp.verified_owner THEN 20 ELSE 0 END + 
+         u.badge_score * 5) DESC,
+        p.created_at DESC
+      LIMIT 50;
+    `;
+  }
+
+  async getPublicDetail(id: string) {
+    // Standard Prisma query for detail view
+    const property = await this.prisma.property.findUnique({
+      where: { id },
+      include: {
+        images: {
+          select: { thumbnail_url: true, highres_url: true } // Show images
+        },
+        landlord: {
+          select: { full_name: true, badge_score: true } // NO PHONE NUMBER
+        },
+      }
+    });
+    
+    return property;
+  }
+}
+```
+
+---
+
+### **STEP 5 — Implement Search Controller**
+**Action:** Edit `apps/api/src/modules/search/search.controller.ts`
+
+```typescript
+import { Controller, Get, Query, Param } from '@nestjs/common';
+import { SearchService } from './search.service';
+import { SearchPropertyDto } from './dto/search-property.dto';
+// Note: NO Guards here. Search is public (Freemium).
+
+@Controller('search')
+export class SearchController {
+  constructor(private readonly searchService: SearchService) {}
+
+  @Get()
+  findAll(@Query() query: SearchPropertyDto) {
+    return this.searchService.search(query);
+  }
+
+  @Get(':id')
+  findOne(@Param('id') id: string) {
+    return this.searchService.getPublicDetail(id);
+  }
+}
+```
+
+---
+
+### **STEP 6 — Test the Search (Postman)**
+
+1.  **Ensure you have a property:**
+    *   Use the `POST /properties` endpoint from Phase 2 to create a listing.
+    *   *Note:* Since we updated the service in Step 1, creating a new property now will correctly set the PostGIS location.
+2.  **Test Radius Search:**
+    *   **Method:** `GET`
+    *   **URL:** `http://localhost:3000/search?lat=0.3476&lng=32.5825&radius=5000` (Kampala coordinates)
+    *   **Expect:** A JSON array of properties. Check that `landlord_phone` is **missing** (Security check).
+3.  **Test Filter:**
+    *   **URL:** `http://localhost:3000/search?maxRent=100000`
+    *   **Expect:** Only cheap properties.
+
+### **Audit Checklist for Phase 3**
+*   [ ] `ST_DWithin` is used in the raw query (not Haversine in JS).
+*   [ ] Search results do **not** contain the landlord's phone number.
+*   [ ] The endpoint is public (no `@UseGuards(JwtAuthGuard)`).
+*   [ ] Property creation now populates the `location` column.
+
+You are now ready for **Phase 4: Plans & Subscription Logic** (The "Gatekeeper").

@@ -1,0 +1,216 @@
+We will use Turborepo with pnpm (for speed), Prisma (as requested), and Docker.
+1. The Monorepo Directory Structure
+This structure ensures code sharing (types, database schema) between your NestJS backend and Expo frontend, enforcing the "Strict API Contract" defined in the sources.
+/uganda-rental-platform
+├── .github/
+│   └── workflows/            # CI/CD (Phase 4)
+├── apps/
+│   ├── api/                  # NestJS Backend [4, 5]
+│   └── mobile/               # React Native Expo [6]
+├── packages/
+│   ├── database/             # Prisma Schema & Client (Shared) [7, 8]
+│   ├── types/                # Shared DTOs & Interfaces [3]
+│   ├── tsconfig/             # Shared TypeScript configurations
+│   └── eslint-config/        # Shared Linting rules
+├── docker-compose.yml        # Local Dev (Postgres, Redis)
+├── pnpm-workspace.yaml       # Monorepo config
+└── turbo.json                # Build pipeline config
+
+--------------------------------------------------------------------------------
+2. Step-by-Step Setup Instructions
+Step A: Scaffolding (Terminal Commands)
+We use pnpm workspaces for efficiency.
+# 1. Create directory
+mkdir uganda-rental-platform && cd uganda-rental-platform
+
+# 2. Initialize pnpm
+pnpm init
+
+# 3. Create pnpm-workspace.yaml
+echo 'packages:
+  - "apps/*"
+  - "packages/*"' > pnpm-workspace.yaml
+
+# 4. Install Turbo
+pnpm add turbo -D -w
+Step B: Shared Database Package (packages/database)
+This allows both the API (for querying) and the Mobile App (for types, if needed) to understand the data shape. We map the V2 Schema to Prisma.
+File: packages/database/prisma/schema.prisma
+// Sources: [7-9] - Production Schema V2
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  tenant
+  landlord
+  admin
+}
+
+enum Status {
+  active
+  paused
+  deleted
+}
+
+model User {
+  id                String    @id @default(uuid())
+  role              Role
+  full_name         String
+  phone             String    @unique
+  email             String?
+  badge_score       Int       @default(0)
+  created_at        DateTime  @default(now())
+  
+  // Relations
+  tenant_profile    TenantProfile?
+  landlord_profile  LandlordProfile?
+  properties        Property[]
+  subscriptions     Subscription[]
+  payments          Payment[]
+  
+  @@map("users")
+}
+
+model Property {
+  id              String   @id @default(uuid())
+  landlord_id     String
+  landlord        User     @relation(fields: [landlord_id], references: [id])
+  title           String
+  rent_amount     Int
+  district        String
+  status          Status   @default(active)
+  
+  // PostGIS support requires raw SQL queries in NestJS, 
+  // but we store coordinates here for basic access.
+  latitude        Decimal
+  longitude       Decimal
+  
+  images          PropertyImage[]
+  visits          Visit[]
+
+  @@index([status, district, rent_amount]) // Composite Index [10]
+  @@map("properties")
+}
+
+model Subscription {
+  id        String   @id @default(uuid())
+  user_id   String
+  tier      String   // budget, family, premium
+  status    String   @default("active")
+  end_date  DateTime
+  user      User     @relation(fields: [user_id], references: [id])
+
+  @@map("subscriptions")
+}
+
+// ... Add Visits, Payments, WebhookLogs tables as per [11, 12]
+Step C: Backend Setup (apps/api)
+Initialize NestJS and configure it to use the shared database package.
+Structure based on:
+apps/api/src/
+├── app.module.ts
+├── modules/
+│   ├── auth/          # JWT, RolesGuard [13]
+│   ├── properties/    # Listings, Images [14]
+│   ├── search/        # PostGIS Logic [15, 16]
+│   ├── subscriptions/ # Gating Logic [17]
+│   ├── payments/      # MTN Webhooks [18]
+│   └── visits/        # Safety Logic [18]
+Implementation Tip: In your package.json for apps/api, add the dependency:
+"dependencies": {
+  "@repo/database": "workspace:*",
+  "@repo/types": "workspace:*"
+}
+Step D: Mobile Setup (apps/mobile)
+Initialize Expo (Managed Workflow) with TypeScript.
+Structure based on:
+apps/mobile/src/
+├── navigation/
+│   ├── AuthStack.tsx      # Login, Register
+│   ├── TenantStack.tsx    # Search, Unlock, Pay [19, 20]
+│   └── LandlordStack.tsx  # Dashboard, Add Property [1]
+├── stores/
+│   ├── useAuthStore.ts    # Zustand (User state)
+│   └── useSearchStore.ts  # Zustand (Filter state)
+├── components/
+│   └── PropertyCard.tsx   # "Blur & Upsell" UI components
+Step E: Docker Configuration (Phase 1 Requirement)
+We need a local database that mirrors the Supabase production environment (PostgreSQL + PostGIS).
+File: docker-compose.yml (Root)
+version: '3.8'
+services:
+  postgres:
+    image: postgis/postgis:15-3.3 # Standard Postgres doesn't have GIS [16]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: rental_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Optional: Redis for BullMQ background jobs (Safety Timers) [21]
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:
+
+--------------------------------------------------------------------------------
+3. Key "Production Grade" Implementations
+To meet your quality requirements, implement these specific configurations:
+1. Strict API Contracts (Shared Types)
+Create packages/types/src/index.ts. This ensures the Frontend never sends data the Backend rejects.
+// Source [3] - API Contracts
+
+export interface CreatePropertyDto {
+  title: string;
+  rent_amount: number;
+  district: string;
+  latitude: number;
+  longitude: number;
+}
+
+export interface SearchResponseDto {
+  id: string;
+  thumbnail_url: string;
+  rent_amount: number;
+  landlord: {
+    badge_score: number;
+    verified: boolean;
+  }
+}
+• Usage:
+    ◦ Backend: class CreatePropertyControllerPayload implements CreatePropertyDto
+    ◦ Frontend: api.post<CreatePropertyDto>('/properties', data)
+2. Environment Validation
+In apps/api/src/config/env.validation.ts, enforce the keys mentioned in Source:
+import { z } from 'zod';
+
+export const envSchema = z.object({
+  DATABASE_URL: z.string(),
+  JWT_SECRET: z.string(),
+  MTN_API_KEY: z.string(), // [22]
+  SUPABASE_URL: z.string(),
+});
+3. Database "Safety" Hooks
+Since you are using Prisma, you must manually implement the PostGIS logic for the "Search Module" because Prisma does not natively support ST_DWithin filters easily.
+• Strategy: Use prisma.$queryRaw for the search endpoint to utilize the geospatial index.
+• Migration: When you run npx prisma migrate dev, create a manual migration to enable the extension:
+4. Immediate Next Steps (Phase 1 Execution)
+1. Run Scaffolding: Execute the terminal commands in Step A.
+2. Define Schema: Copy the full Prisma schema into packages/database.
+3. Start Docker: Run docker-compose up -d to get the DB running.
+4. Sync DB: Run npx prisma migrate dev to create the tables.
+5. Initialize Git: Commit the setup.
+This setup prepares you for Phase 2, where you will build the UsersModule and AuthModule using the shared database client.

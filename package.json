@@ -1,0 +1,16 @@
+{
+  "name": "uganda-rental-platform",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "demo:start": "powershell -ExecutionPolicy Bypass -File scripts/demo-start.ps1"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.3"
+  }
+}

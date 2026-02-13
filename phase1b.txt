@@ -1,0 +1,173 @@
+STEP 1 — Create Docker Compose (With PostGIS)
+We cannot use the standard postgres image because your architecture relies on ST_DWithin and GEOGRAPHY types for the "Search by Radius" feature.
+Action: Create file uganda-rental-platform/docker-compose.yml
+version: "3.9"
+
+services:
+  postgres:
+    # CRITICAL: Must use PostGIS image, not standard Postgres
+    image: postgis/postgis:15-3.3
+    container_name: rentflow_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: rentflow
+      POSTGRES_PASSWORD: rentflow
+      POSTGRES_DB: rentflow_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Optional: Redis is required if you implement the BullMQ Safety Timers later [3]
+  redis:
+    image: redis:alpine
+    container_name: rentflow_redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:
+STEP 2 — Start the Database
+Action: Run this from the root uganda-rental-platform/ folder:
+docker compose up -d
+Verification: Run docker ps. You should see rentflow_postgres running on port 0.0.0.0:5432.
+STEP 3 — Configure Backend Environment
+Action: Create or edit apps/api/.env.
+Ensure your database URL matches the Docker credentials.
+# Connect to Local Docker Container
+DATABASE_URL="postgresql://rentflow:rentflow@localhost:5432/rentflow_db?schema=public"
+
+# Other keys required by your Architecture [4]
+JWT_SECRET="dev_secret_key_change_in_prod"
+PORT=3000
+STEP 4 — Define the Prisma Schema (V2)
+Your migration will fail if the schema file doesn't exist. You must map the V2 Production Schema to Prisma.
+Action: Open packages/database/prisma/schema.prisma (or apps/api/prisma/schema.prisma if not using monorepo packages yet) and paste this:
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Enums from V2 Schema [5]
+enum Role {
+  tenant
+  landlord
+  admin
+}
+
+enum Status {
+  active
+  paused
+  deleted
+}
+
+model User {
+  id                String    @id @default(uuid())
+  role              Role
+  full_name         String
+  phone             String    @unique
+  email             String?
+  national_id       String?
+  selfie_url        String?
+  is_identity_verified Boolean @default(false)
+  badge_score       Int       @default(0)
+  created_at        DateTime  @default(now())
+  
+  // Relations
+  tenant_profile    TenantProfile?
+  landlord_profile  LandlordProfile?
+  properties        Property[]
+  subscriptions     Subscription[]
+  visits_as_tenant  Visit[] @relation("TenantVisits")
+  visits_as_landlord Visit[] @relation("LandlordVisits")
+  
+  @@map("users")
+}
+
+model TenantProfile {
+  user_id           String @id
+  employment_status String?
+  user              User   @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  
+  @@map("tenant_profiles")
+}
+
+model LandlordProfile {
+  user_id           String @id
+  verified_owner    Boolean @default(false)
+  user              User   @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  
+  @@map("landlord_profiles")
+}
+
+model Property {
+  id              String   @id @default(uuid())
+  landlord_id     String
+  landlord        User     @relation(fields: [landlord_id], references: [id], onDelete: Cascade)
+  title           String
+  rent_amount     Int
+  district        String
+  latitude        Decimal  // Used for standard CRUD
+  longitude       Decimal  // Used for standard CRUD
+  status          Status   @default(active)
+  
+  images          PropertyImage[]
+  visits          Visit[]
+
+  // Composite Index for Search Module [8]
+  @@index([status, district, rent_amount])
+  @@map("properties")
+}
+
+model PropertyImage {
+  id            String @id @default(uuid())
+  property_id   String
+  property      Property @relation(fields: [property_id], references: [id], onDelete: Cascade)
+  thumbnail_url String
+  highres_url   String
+  
+  @@map("property_images")
+}
+
+model Subscription {
+  id        String   @id @default(uuid())
+  user_id   String
+  tier      String   // budget, family, premium
+  status    String   @default("active")
+  end_date  DateTime
+  user      User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
+
+model Visit {
+  id              String   @id @default(uuid())
+  property_id     String
+  tenant_id       String
+  landlord_id     String
+  property        Property @relation(fields: [property_id], references: [id])
+  tenant          User     @relation("TenantVisits", fields: [tenant_id], references: [id])
+  landlord        User     @relation("LandlordVisits", fields: [landlord_id], references: [id])
+  
+  scheduled_time  DateTime
+  arrival_confirmed Boolean @default(false)
+  completion_confirmed Boolean @default(false)
+  safety_alert_triggered Boolean @default(false)
+
+  @@map("visits")
+}
+STEP 5 — Run First Migration
+Now that the connection is open and the schema is defined, apply it.
+Action: Run inside apps/api (or root if using Turbo):
+npx prisma migrate dev --name init_v2_schema
+STEP 6 — Enable PostGIS (Crucial for Search)
+Prisma does not automatically enable the postgis extension required for your Search Module. You must do this manually once.
+Action:
+1. Connect to your DB (using a tool like TablePlus, DBeaver, or command line).
+2. Run this SQL:
+3. (Note: The search service in search.service.ts uses raw SQL ST_DWithin, which will fail if this extension is not active).
+Status Check: If Step 5 completes with "The following migration have been applied", your local development environment is Ready for Phase 2 (Core Backend).

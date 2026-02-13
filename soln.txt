@@ -1,0 +1,200 @@
+Here is the immediate fix to get your migration running.
+1. Create a .env file in the database package
+Go to packages/database/ and create a file named .env.
+File: packages/database/.env Paste the connection string that matches your Docker configuration:
+# Connect to Local Docker Container
+DATABASE_URL="postgresql://rentflow:rentflow@localhost:5432/rentflow_db?schema=public"
+2. Verify your schema.prisma configuration
+Ensure your packages/database/prisma/schema.prisma file is pointing to the environment variable correctly (lines 6-8):
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+3. Re-run the Migration
+Now run the command again from your terminal:
+pnpm --filter @repo/database run migrate:dev
+Why this happened
+In a Monorepo:
+• apps/api needs DATABASE_URL to run the server.
+• packages/database needs DATABASE_URL to run migrations.
+You often need a .env file in both locations during development. In production (Phase 5), we will inject these variables via the hosting platform (Railway/Render).
+POSIBLE SOLUTION
+STEP 1 — Define the Business Logic (The "Rules")
+Since the V2 Schema uses a simple tier string (budget, family, premium), we need a central place in the code to define what those tiers actually do.
+Action: Create apps/api/src/common/config/plans.config.ts
+export const SUBSCRIPTION_PLANS = {
+  budget: {
+    id: 'budget',
+    name: 'Budget Tier',
+    price: 5000,
+    duration_days: 30,
+    max_rent_limit: 500000, // Can only unlock houses under 500k
+    description: 'Perfect for students and singles.',
+  },
+  family: {
+    id: 'family',
+    name: 'Family Saver',
+    price: 30000,
+    duration_days: 90, // 3 Months
+    max_rent_limit: 1000000, // Can unlock houses under 1M
+    description: 'Best value for families.',
+  },
+  premium: {
+    id: 'premium',
+    name: 'Premium Flex',
+    price: 75000,
+    duration_days: 30,
+    max_rent_limit: Infinity, // No limit
+    description: 'VIP access to everything.',
+  },
+};
+
+--------------------------------------------------------------------------------
+STEP 2 — Create the Subscriptions Module
+Action: Run inside apps/api:
+nest g module modules/subscriptions
+nest g controller modules/subscriptions
+nest g service modules/subscriptions
+
+--------------------------------------------------------------------------------
+STEP 3 — Implement the Gatekeeper Logic (Service)
+This service checks if a user is "rich enough" (subscription-wise) to view a specific property.
+Action: Edit apps/api/src/modules/subscriptions/subscriptions.service.ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../../prisma/prisma.service';
+import { SUBSCRIPTION_PLANS } from '../../common/config/plans.config';
+
+@Injectable()
+export class SubscriptionsService {
+  constructor(private prisma: PrismaService) {}
+
+  // 1. Get the current user's active plan
+  async getActiveSubscription(userId: string) {
+    const sub = await this.prisma.subscription.findFirst({
+      where: {
+        user_id: userId,
+        status: 'active',
+        end_date: { gt: new Date() }, // Must not be expired
+      },
+      orderBy: { end_date: 'desc' }, // Get the latest one
+    });
+
+    if (!sub) return null;
+    
+    // Merge DB record with our config to get the limits
+    const planDetails = SUBSCRIPTION_PLANS[sub.tier];
+    return { ...sub, ...planDetails };
+  }
+
+  // 2. The Core "Unlock" Logic
+  async canUnlockProperty(userId: string, rentAmount: number) {
+    const activeSub = await this.getActiveSubscription(userId);
+
+    // Scenario A: No Subscription
+    if (!activeSub) {
+      return { 
+        allowed: false, 
+        reason: 'no_subscription',
+        required_tier: this.getRequiredTier(rentAmount) 
+      };
+    }
+
+    // Scenario B: Subscription exists, but rent is too high (e.g., Budget User looking at 800k house)
+    if (activeSub.max_rent_limit < rentAmount) {
+      return { 
+        allowed: false, 
+        reason: 'upgrade_required',
+        current_tier: activeSub.name,
+        required_tier: this.getRequiredTier(rentAmount)
+      };
+    }
+
+    // Scenario C: Allowed
+    return { allowed: true };
+  }
+
+  // Helper to tell the frontend what to upsell
+  private getRequiredTier(rent: number) {
+    if (rent <= 500000) return SUBSCRIPTION_PLANS.budget;
+    if (rent <= 1000000) return SUBSCRIPTION_PLANS.family;
+    return SUBSCRIPTION_PLANS.premium;
+  }
+  
+  // 3. Expose Plans to Frontend
+  getPlans() {
+    return Object.values(SUBSCRIPTION_PLANS);
+  }
+}
+
+--------------------------------------------------------------------------------
+STEP 4 — Create the Unlock Controller (The API)
+This is the endpoint the Mobile App hits when the user taps "Show Phone Number".
+Action: Edit apps/api/src/modules/subscriptions/subscriptions.controller.ts
+import { Controller, Get, Param, UseGuards, Request, NotFoundException } from '@nestjs/common';
+import { SubscriptionsService } from './subscriptions.service';
+import { PrismaService } from '../../prisma/prisma.service';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard'; // Use the guard from Phase 2
+
+@Controller()
+export class SubscriptionsController {
+  constructor(
+    private subscriptionsService: SubscriptionsService,
+    private prisma: PrismaService,
+  ) {}
+
+  // 1. Show available plans (For the Pricing Screen)
+  @Get('plans')
+  getPlans() {
+    return this.subscriptionsService.getPlans();
+  }
+
+  // 2. Check my status (For Profile Screen)
+  @UseGuards(JwtAuthGuard)
+  @Get('subscriptions/me')
+  async getMySubscription(@Request() req) {
+    return this.subscriptionsService.getActiveSubscription(req.user.id);
+  }
+
+  // 3. THE PAYWALL: Try to unlock a property
+  @UseGuards(JwtAuthGuard)
+  @Get('unlock/:propertyId')
+  async unlockProperty(@Request() req, @Param('propertyId') propertyId: string) {
+    // A. Fetch the property price
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+      include: { landlord: true }, // Need landlord info to return phone
+    });
+
+    if (!property) throw new NotFoundException('Property not found');
+
+    // B. Run the Gatekeeper Logic
+    const access = await this.subscriptionsService.canUnlockProperty(
+      req.user.id,
+      property.rent_amount,
+    );
+
+    // C. Handle Rejection (Upsell)
+    if (!access.allowed) {
+      return {
+        allowed: false,
+        message: access.reason === 'no_subscription' 
+          ? 'You need a subscription to view this contact.' 
+          : `This property is above your ${access.current_tier} limit.`,
+        upsell: {
+          recommended_plan: access.required_tier,
+          all_plans: this.subscriptionsService.getPlans(),
+        }
+      };
+    }
+
+    // D. Handle Success (Reveal Data)
+    return {
+      allowed: true,
+      landlord_phone: property.landlord.phone, // THE PRIZE
+      landlord_name: property.landlord.full_name,
+      safety_warning: "Remember: Do not pay any money before viewing the property.",
+    };
+  }
+}
+
+-------------------------------------------------------------------------------

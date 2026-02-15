@@ -6,7 +6,7 @@ export const paymentWebhookSchema = z.object({
   userId: z.string().min(1),
   tier: z.enum(["budget", "family", "premium"]),
   amount: z.number().int().positive(),
-  currency: z.string().min(3).max(8)
+  currency: z.literal("UGX")
 });
 
 export const webhookHeadersSchema = z.object({

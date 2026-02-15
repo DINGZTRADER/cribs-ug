@@ -7,3 +7,7 @@ pnpm-lock.yaml
 dist
 coverage
 *.log
+
+.expo
+web_prototypes
+stitch (1).zip
